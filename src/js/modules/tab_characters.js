@@ -275,22 +275,48 @@ function reset_module_state() {
 //endregion
 
 //region appearance
+// serialize concurrent refresh requests. The Characters tab registers several
+// reactive watchers (chrEquippedItems, chrEquippedItemSkins, chrCustActiveChoices,
+// chrGuildTabardConfig, etc.) that each call refresh_character_appearance on
+// their own; a single equip change typically mutates two or three of these in
+// the same tick, so multiple async refreshes start in parallel. update_textures
+// is await-heavy and shares the per-material WebGL canvas state via the
+// chr_materials map, so interleaving runs produce non-deterministic bakes where
+// one item's texture targets get pushed onto another run's canvas. The guard
+// coalesces overlapping requests: a second call while one is in flight just
+// marks pending, and the in-flight refresh loops once more before resolving.
+let _active_refresh = null;
+let _pending_refresh = false;
 async function refresh_character_appearance(core) {
 	if (!active_renderer || is_importing)
 		return;
 
-	// check if a conditional model swap is needed (e.g. upright orc)
-	if (await check_cond_model_swap(core))
-		return;
+	if (_active_refresh) {
+		_pending_refresh = true;
+		return _active_refresh;
+	}
 
-	log.write('Refreshing character appearance...');
+	const _do_refresh = async () => {
+		do {
+			_pending_refresh = false;
 
-	update_geosets(core);
-	await update_textures(core);
-	await update_skinned_models(core);
-	await update_equipment_models(core);
+			// check if a conditional model swap is needed (e.g. upright orc)
+			if (await check_cond_model_swap(core))
+				return;
 
-	log.write('Character appearance refresh complete');
+			log.write('Refreshing character appearance...');
+
+			update_geosets(core);
+			await update_textures(core);
+			await update_skinned_models(core);
+			await update_equipment_models(core);
+
+			log.write('Character appearance refresh complete');
+		} while (_pending_refresh);
+	};
+
+	_active_refresh = _do_refresh().finally(() => { _active_refresh = null; });
+	return _active_refresh;
 }
 
 async function check_cond_model_swap(core) {
